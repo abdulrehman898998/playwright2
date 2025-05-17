@@ -3,7 +3,7 @@ const { chromium } = require('playwright');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 6000; // Different port to avoid conflict
+const PORT = process.env.PORT || 6000;
 
 app.use(cors());
 app.use(express.json());
@@ -59,19 +59,46 @@ async function scrapeFathomMetadata(videoUrl) {
       console.log('#app not found, skipping data-page extraction');
     }
 
-    // Fallback metadata
-    const title = await page.title() || 'No Title';
+    // Parse data-page JSON if available
+    let callData = { started_at: '1970-01-01', host: { email: 'Unknown' }, byline: 'Unknown', title: 'No Title', video_url: videoUrl, duration: 0 };
+    if (dataPageJson) {
+      try {
+        const parsedData = JSON.parse(dataPageJson.replace(/'/g, '"').replace(/\\"/g, '"')); // Handle single quotes and escaped quotes
+        const props = parsedData.props || {};
+        callData = props.call || callData;
+      } catch (parseErr) {
+        console.error('JSON parse error:', parseErr.message);
+      }
+    }
+
+    // Format the data
+    const CallDate = new Date(callData.started_at || '1970-01-01').toISOString().split('T')[0];
+    const SalespersonName = callData.host?.email || 'Unknown';
+    const ProspectName = callData.byline || 'Unknown';
+    const CallDurationSeconds = callData.duration || 0;
+    const minutes = Math.floor(CallDurationSeconds / 60);
+    const seconds = Math.round(CallDurationSeconds % 60);
+    const CallDuration = `${minutes} minutes ${seconds} seconds`;
+    const TranscriptLink = callData.video_url || videoUrl;
+    const Title = callData.title || (await page.title()) || 'No Title';
+
     return {
-      dataPageJson: dataPageJson || 'Not found', // Raw JSON string to parse in n8n
-      title: title,
-      videoUrl: videoUrl
+      CallDate,
+      SalespersonName,
+      ProspectName,
+      CallDuration,
+      TranscriptLink,
+      Title
     };
   } catch (err) {
     console.error('Metadata scraping error:', err.message);
     return {
-      dataPageJson: 'Not found',
-      title: 'No Title',
-      videoUrl: videoUrl,
+      CallDate: 'Unknown',
+      SalespersonName: 'Unknown',
+      ProspectName: 'Unknown',
+      CallDuration: 'Unknown',
+      TranscriptLink: videoUrl,
+      Title: 'No Title',
       error: err.message
     };
   } finally {
@@ -98,7 +125,7 @@ app.post('/scrape-metadata', async (req, res) => {
     console.log(`Attempt ${attempt + 1} of ${maxAttempts}`);
     try {
       metadata = await scrapeFathomMetadata(videoUrl);
-      if (metadata.dataPageJson !== 'Not found' || attempt === maxAttempts - 1) break;
+      if (!metadata.error) break; // Exit if no error
     } catch (err) {
       console.error(`Attempt ${attempt + 1} failed:`, err.message);
     }
@@ -108,9 +135,12 @@ app.post('/scrape-metadata', async (req, res) => {
 
   if (!metadata) {
     metadata = {
-      dataPageJson: 'Not found',
-      title: 'No Title',
-      videoUrl: videoUrl
+      CallDate: 'Unknown',
+      SalespersonName: 'Unknown',
+      ProspectName: 'Unknown',
+      CallDuration: 'Unknown',
+      TranscriptLink: videoUrl,
+      Title: 'No Title'
     };
   }
 
