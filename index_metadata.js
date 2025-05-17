@@ -3,15 +3,15 @@ const { chromium } = require('playwright');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 6000; // Different port to avoid conflict
 
 app.use(cors());
 app.use(express.json());
 
-async function scrapeFathomTranscript(videoUrl) {
+async function scrapeFathomMetadata(videoUrl) {
   let browser;
   try {
-    console.log('Launching browser for transcript...');
+    console.log('Launching browser for metadata...');
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: null });
 
@@ -37,100 +37,43 @@ async function scrapeFathomTranscript(videoUrl) {
       }
     }
 
-    // Wait for transcript container
-    const transcriptPath = 'page-call-detail-transcript';
-    let transcriptContainer = null;
+    // Extract raw data-page from #app
+    let appDataHandle = null;
     try {
-      transcriptContainer = await page.waitForSelector(transcriptPath, { state: 'attached', timeout: 300000 });
+      appDataHandle = await page.waitForSelector('#app', { state: 'attached', timeout: 300000 });
     } catch (err) {
-      console.error('Transcript container not found:', err.message);
-      throw new Error('Transcript container not found');
-    }
-    console.log('Transcript container found');
-
-    // Click transcript button if present
-    const showButtonSelectors = [
-      'button:has-text("transcript")',
-      'button:has-text("show transcript")',
-      '[aria-label*="transcript"]',
-      '[role="button"][aria-label*="captions"]'
-    ];
-
-    let showButton = null;
-    for (const selector of showButtonSelectors) {
-      showButton = await page.$(selector);
-      if (showButton) break;
+      console.error('#app not found:', err.message);
+      appDataHandle = null;
     }
 
-    if (showButton) {
-      console.log('Transcript button found, clicking...');
-      await showButton.click();
-      // Wait for content with extended timeout
-      await page.waitForFunction(() => {
-        const container = document.querySelector('page-call-detail-transcript');
-        return container && (container.innerText.length > 0 || Array.from(container.querySelectorAll('*')).some(el => el.innerText.trim().length > 0));
-      }, { timeout: 300000 });
-      console.log('Transcript button clicked, content loading confirmed');
-    } else {
-      console.log('Transcript button not found, proceeding without click.');
-      // Wait for content even without button click
-      await page.waitForFunction(() => {
-        const container = document.querySelector('page-call-detail-transcript');
-        return container && (container.innerText.length > 0 || Array.from(container.querySelectorAll('*')).some(el => el.innerText.trim().length > 0));
-      }, { timeout: 300000 });
-    }
-
-    // Wait for any transcript-related API responses
-    try {
-      await page.waitForResponse(response => response.url().includes('transcript') && response.status() === 200, { timeout: 180000 });
-      console.log('Transcript API response received');
-    } catch (err) {
-      console.log('No transcript API response found, proceeding with DOM scraping:', err.message);
-    }
-
-    let transcriptElements = await page.$$('page-call-detail-transcript div[class*="transcript-line"], page-call-detail-transcript div[class*="transcript-text"], page-call-detail-transcript div');
-    let transcript = [];
-
-    if (transcriptElements.length > 0) {
-      console.log(`${transcriptElements.length} transcript elements found (specific classes).`);
-      for (const element of transcriptElements) {
-        let text;
-        if (await element.isVisible()) {
-          text = await element.innerText({ timeout: 180000 });
-        } else {
-          console.log('Element hidden, forcing text extraction...');
-          text = await element.evaluate(el => el.textContent || el.innerText);
-        }
-        const cleanedText = text.trim();
-        if (cleanedText && !cleanedText.startsWith('[')) {
-          transcript.push(cleanedText);
-        }
+    let dataPageJson = null;
+    if (appDataHandle) {
+      console.log('#app element found');
+      dataPageJson = await appDataHandle.getAttribute('data-page');
+      if (!dataPageJson) {
+        console.log('data-page attribute not found');
+      } else {
+        console.log('data-page extracted:', dataPageJson);
       }
     } else {
-      console.log('Specific transcript elements not found, trying all elements.');
-      transcriptElements = await page.$$('page-call-detail-transcript *');
-      for (const element of transcriptElements) {
-        let text;
-        if (await element.isVisible()) {
-          text = await element.innerText({ timeout: 180000 });
-        } else {
-          console.log('Element hidden, forcing text extraction...');
-          text = await element.evaluate(el => el.textContent || el.innerText);
-        }
-        const cleanedText = text.trim();
-        if (cleanedText && !cleanedText.startsWith('[')) {
-          transcript.push(cleanedText);
-        }
-      }
+      console.log('#app not found, skipping data-page extraction');
     }
 
-    const transcriptText = transcript.length > 0 ? transcript.join('\n') : 'No transcript found.';
-    console.log('Transcript scraped:', transcriptText);
-    return transcriptText;
-  } catch (error) {
-    const errorMessage = `Error scraping transcript: ${error.message}`;
-    console.error(errorMessage);
-    return errorMessage;
+    // Fallback metadata
+    const title = await page.title() || 'No Title';
+    return {
+      dataPageJson: dataPageJson || 'Not found', // Raw JSON string to parse in n8n
+      title: title,
+      videoUrl: videoUrl
+    };
+  } catch (err) {
+    console.error('Metadata scraping error:', err.message);
+    return {
+      dataPageJson: 'Not found',
+      title: 'No Title',
+      videoUrl: videoUrl,
+      error: err.message
+    };
   } finally {
     if (browser) await browser.close().catch(err => console.error('Browser close failed:', err.message));
     console.log('Browser closed');
@@ -138,24 +81,24 @@ async function scrapeFathomTranscript(videoUrl) {
 }
 
 app.get('/', (req, res) => {
-  res.send('Transcript service is running!');
+  res.send('Metadata service is running!');
 });
 
-app.post('/scrape-transcript', async (req, res) => {
+app.post('/scrape-metadata', async (req, res) => {
   const { videoUrl } = req.body;
   if (!videoUrl) {
     return res.status(400).json({ error: 'Missing videoUrl' });
   }
 
-  let transcript = 'Transcript unavailable';
+  let metadata = null;
   let attempt = 0;
   const maxAttempts = 5;
 
   while (attempt < maxAttempts) {
     console.log(`Attempt ${attempt + 1} of ${maxAttempts}`);
     try {
-      transcript = await scrapeFathomTranscript(videoUrl);
-      if (!transcript.startsWith('Transcript unavailable')) break;
+      metadata = await scrapeFathomMetadata(videoUrl);
+      if (metadata.dataPageJson !== 'Not found' || attempt === maxAttempts - 1) break;
     } catch (err) {
       console.error(`Attempt ${attempt + 1} failed:`, err.message);
     }
@@ -163,9 +106,17 @@ app.post('/scrape-transcript', async (req, res) => {
     if (attempt < maxAttempts) await new Promise(resolve => setTimeout(resolve, 15000)); // Wait 15 seconds before retry
   }
 
-  res.json({ transcript });
+  if (!metadata) {
+    metadata = {
+      dataPageJson: 'Not found',
+      title: 'No Title',
+      videoUrl: videoUrl
+    };
+  }
+
+  res.json(metadata);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Transcript service running on port ${PORT}`);
+  console.log(`Metadata service running on port ${PORT}`);
 });
